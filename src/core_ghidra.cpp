@@ -1,8 +1,9 @@
-/* radare - LGPL - Copyright 2019 - thestr4ng3r */
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include "R2Architecture.h"
+#include "RizinArchitecture.h"
 #include "CodeXMLParse.h"
 #include "ArchMap.h"
+#include "rz_ghidra.h"
 
 // Windows clash
 #ifdef restrict
@@ -12,13 +13,13 @@
 #include <libdecomp.hh>
 #include <printc.hh>
 
-#include <r_core.h>
+#include <rz_core.h>
 
 #include <vector>
 #include <mutex>
 
 #define CMD_PREFIX "pdg"
-#define CFG_PREFIX "r2ghidra"
+#define CFG_PREFIX "ghidra"
 
 typedef bool (*ConfigVarCb)(void *user, void *data);
 
@@ -41,11 +42,11 @@ struct ConfigVar
 		const char *GetDesc() const					{ return desc; }
 		ConfigVarCb GetCallback() const				{ return callback; }
 
-		ut64 GetInt(RConfig *cfg) const				{ return r_config_get_i(cfg, name.c_str()); }
-		bool GetBool(RConfig *cfg) const			{ return GetInt(cfg) != 0; }
-		std::string GetString(RConfig *cfg) const	{ return r_config_get(cfg, name.c_str()); }
+		ut64 GetInt(RzConfig *cfg) const				{ return rz_config_get_i(cfg, name.c_str()); }
+		bool GetBool(RzConfig *cfg) const			{ return GetInt(cfg) != 0; }
+		std::string GetString(RzConfig *cfg) const	{ return rz_config_get(cfg, name.c_str()); }
 
-		void Set(RConfig *cfg, const char *s) const	{ r_config_set(cfg, name.c_str(), s); }
+		void Set(RzConfig *cfg, const char *s) const	{ rz_config_set(cfg, name.c_str(), s); }
 
 		static const std::vector<const ConfigVar *> &GetAll()	{ return vars_all; }
 };
@@ -61,6 +62,7 @@ static const ConfigVar cfg_var_nl_brace     ("nl.brace",    "false",    "Newline
 static const ConfigVar cfg_var_nl_else      ("nl.else",     "false",    "Newline before else");
 static const ConfigVar cfg_var_indent       ("indent",      "4",        "Indent increment");
 static const ConfigVar cfg_var_linelen      ("linelen",     "120",      "Max line length");
+static const ConfigVar cfg_var_maximplref   ("maximplref",  "2",        "Maximum number of references to an expression before showing an explicit variable.");
 static const ConfigVar cfg_var_rawptr       ("rawptr",      "true",     "Show unknown globals as raw addresses instead of variables");
 static const ConfigVar cfg_var_verbose      ("verbose",      "true",    "Show verbose warning messages while decompiling");
 
@@ -75,9 +77,9 @@ class DecompilerLock
 		{
 			if(!decompiler_mutex.try_lock())
 			{
-				void *bed = r_cons_sleep_begin();
+				void *bed = rz_cons_sleep_begin();
 				decompiler_mutex.lock();
-				r_cons_sleep_end(bed);
+				rz_cons_sleep_end(bed);
 			}
 		}
 
@@ -87,7 +89,7 @@ class DecompilerLock
 		}
 };
 
-static void PrintUsage(const RCore *const core)
+static void PrintUsage(const RzCore *const core)
 {
 	const char* help[] = {
 		"Usage: " CMD_PREFIX, "", "# Native Ghidra decompiler plugin",
@@ -99,20 +101,21 @@ static void PrintUsage(const RCore *const core)
 		CMD_PREFIX"s",  "", "# Display loaded Sleigh Languages",
 		CMD_PREFIX"ss", "", "# Display automatically matched Sleigh Language ID",
 		CMD_PREFIX"sd", " N", "# Disassemble N instructions with Sleigh and print pcode",
-		CMD_PREFIX"*",  "", "# Decompiled code is returned to r2 as comment",
+		CMD_PREFIX"a", "", "# Switch to RzAsm and RzAnalysis plugins driven by SLEIGH from Ghidra",
+		CMD_PREFIX"*",  "", "# Decompiled code is returned to rizin as comment",
 		"Environment:", "", "",
 		"%SLEIGHHOME" , "", "# Path to ghidra build root directory",
 		NULL
 	};
 
-	r_cons_cmd_help(help, core->print->flags & R_PRINT_FLAGS_COLOR);
+	rz_cons_cmd_help(help, core->print->flags & RZ_PRINT_FLAGS_COLOR);
 }
 
 enum class DecompileMode { DEFAULT, XML, DEBUG_XML, OFFSET, STATEMENTS, JSON };
 
 //#define DEBUG_EXCEPTIONS
 
-static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c)
+static void ApplyPrintCConfig(RzConfig *cfg, PrintC *print_c)
 {
 	if(!print_c)
 		return;
@@ -132,7 +135,120 @@ static void ApplyPrintCConfig(RConfig *cfg, PrintC *print_c)
 	print_c->setMaxLineSize(cfg_var_linelen.GetInt(cfg));
 }
 
-static void Decompile(RCore *core, DecompileMode mode)
+static void Decompile(RzCore *core, ut64 addr, DecompileMode mode, std::stringstream &out_stream, RzAnnotatedCode **out_code)
+{
+	RzAnalysisFunction *function = rz_analysis_get_fcn_in(core->analysis, addr, RZ_ANALYSIS_FCN_TYPE_NULL);
+	if(!function)
+		throw LowlevelError("No function at this offset");
+	RizinArchitecture arch(core, cfg_var_sleighid.GetString(core->config));
+	DocumentStorage store;
+	arch.max_implied_ref = cfg_var_maximplref.GetInt(core->config);
+	arch.setRawPtr(cfg_var_rawptr.GetBool(core->config));
+	arch.init(store);
+	Funcdata *func = arch.symboltab->getGlobalScope()->findFunction(Address(arch.getDefaultCodeSpace(), function->addr));
+	arch.print->setOutputStream(&out_stream);
+	arch.setPrintLanguage("rizin-c-language");
+	ApplyPrintCConfig(core->config, dynamic_cast<PrintC *>(arch.print));
+	if(!func)
+		throw LowlevelError("No function in Scope");
+	arch.getCore()->sleepBegin();
+	auto action = arch.allacts.getCurrent();
+	int res;
+#ifndef DEBUG_EXCEPTIONS
+	try
+	{
+#endif
+		action->reset(*func);
+		res = action->perform(*func);
+#ifndef DEBUG_EXCEPTIONS
+	}
+	catch(const LowlevelError &error)
+	{
+		arch.getCore()->sleepEndForce();
+		throw error;
+	}
+#endif
+	arch.getCore()->sleepEnd();
+	if (res<0)
+		eprintf("break\n");
+	/*else
+	{
+		eprintf("Decompilation complete\n");
+		if(res==0)
+			eprintf("(no change)\n");
+	}*/
+	if(cfg_var_verbose.GetBool(core->config))
+	{
+		for(const auto &warning : arch.getWarnings())
+			func->warningHeader("[rz-ghidra] " + warning);
+	}
+	switch (mode)
+	{
+		case DecompileMode::XML:
+		case DecompileMode::DEFAULT:
+		case DecompileMode::JSON:
+		case DecompileMode::OFFSET:
+		case DecompileMode::STATEMENTS:
+			arch.print->setXML(true);
+			break;
+		default:
+			break;
+	}
+	if(mode == DecompileMode::XML)
+	{
+		out_stream << "<result><function>";
+		func->saveXml(out_stream, 0, true);
+		out_stream << "</function><code>";
+	}
+	switch(mode)
+	{
+		case DecompileMode::XML:
+		case DecompileMode::DEFAULT:
+		case DecompileMode::JSON:
+		case DecompileMode::OFFSET:
+		case DecompileMode::STATEMENTS:
+			arch.print->docFunction(func);
+			if(mode != DecompileMode::XML)
+			{
+				*out_code = ParseCodeXML(func, out_stream.str().c_str());
+				if (!*out_code)
+					throw LowlevelError("Failed to parse XML code from Decompiler");
+			}
+			break;
+		case DecompileMode::DEBUG_XML:
+			arch.saveXml(out_stream);
+			break;
+		default:
+			break;
+	}
+}
+
+RZ_API RzAnnotatedCode *rz_ghidra_decompile_annotated_code(RzCore *core, ut64 addr)
+{
+	DecompilerLock lock;
+	RzAnnotatedCode *code = nullptr;
+#ifndef DEBUG_EXCEPTIONS
+	try
+	{
+#endif
+		std::stringstream out_stream;
+		Decompile(core, addr, DecompileMode::DEFAULT, out_stream, &code);
+		return code;
+#ifndef DEBUG_EXCEPTIONS
+	}
+	catch(const LowlevelError &error)
+	{
+		std::string s = "Ghidra Decompiler Error: " + error.explain;
+		char *err = strdup (s.c_str());
+ 		code = rz_annotated_code_new(err);
+		// Push an annotation with: range = full string, type = error
+		// For this, we have to modify RzAnnotatedCode to have one more type; for errors
+		return code;
+	}
+#endif
+}
+
+static void DecompileCmd(RzCore *core, DecompileMode mode)
 {
 	DecompilerLock lock;
 
@@ -140,128 +256,35 @@ static void Decompile(RCore *core, DecompileMode mode)
 	try
 	{
 #endif
-		RAnalFunction *function = r_anal_get_fcn_in(core->anal, core->offset, R_ANAL_FCN_TYPE_NULL);
-		if(!function)
-			throw LowlevelError("No function at this offset");
-
-		R2Architecture arch(core, cfg_var_sleighid.GetString(core->config));
-		DocumentStorage store;
-		arch.setRawPtr(cfg_var_rawptr.GetBool(core->config));
-		arch.init(store);
-
+		RzAnnotatedCode *code = nullptr;
 		std::stringstream out_stream;
-		arch.print->setOutputStream(&out_stream);
-
-		arch.setPrintLanguage("r2-c-language");
-		ApplyPrintCConfig(core->config, dynamic_cast<PrintC *>(arch.print));
-
-		Funcdata *func = arch.symboltab->getGlobalScope()->findFunction(Address(arch.getDefaultCodeSpace(), function->addr));
-		if(!func)
-			throw LowlevelError("No function in Scope");
-
-		arch.getCore()->sleepBegin();
-		auto action = arch.allacts.getCurrent();
-		int res;
-#ifndef DEBUG_EXCEPTIONS
-		try
-		{
-#endif
-			action->reset(*func);
-			res = action->perform(*func);
-#ifndef DEBUG_EXCEPTIONS
-		}
-		catch(const LowlevelError &error)
-		{
-			arch.getCore()->sleepEndForce();
-			throw error;
-		}
-#endif
-		arch.getCore()->sleepEnd();
-		if (res<0)
-			eprintf("break\n");
-		/*else
-		{
-			eprintf("Decompilation complete\n");
-			if(res==0)
-				eprintf("(no change)\n");
-		}*/
-
-		if(cfg_var_verbose.GetBool(core->config))
-		{
-			for(const auto &warning : arch.getWarnings())
-				func->warningHeader("[r2ghidra] " + warning);
-		}
-
-		switch (mode)
-		{
-			case DecompileMode::XML:
-			case DecompileMode::DEFAULT:
-			case DecompileMode::JSON:
-			case DecompileMode::OFFSET:
-			case DecompileMode::STATEMENTS:
-				arch.print->setXML(true);
-				break;
-			default:
-				break;
-		}
-
-		if(mode == DecompileMode::XML)
-		{
-			out_stream << "<result><function>";
-			func->saveXml(out_stream, 0, true);
-			out_stream << "</function><code>";
-		}
-
-		RAnnotatedCode *code = nullptr;
-		switch(mode)
-		{
-			case DecompileMode::XML:
-			case DecompileMode::DEFAULT:
-			case DecompileMode::JSON:
-			case DecompileMode::OFFSET:
-			case DecompileMode::STATEMENTS:
-				arch.print->docFunction(func);
-				if(mode != DecompileMode::XML)
-				{
-					code = ParseCodeXML(func, out_stream.str().c_str());
-					if (!code)
-						throw LowlevelError("Failed to parse XML code from Decompiler");
-				}
-				break;
-			case DecompileMode::DEBUG_XML:
-				arch.saveXml(out_stream);
-				break;
-			default:
-				break;
-		}
-
+		Decompile(core, core->offset, mode, out_stream, &code);
 		switch(mode)
 		{
 			case DecompileMode::OFFSET:
 			{
-				RVector *offsets = r_annotated_code_line_offsets(code);
-				r_core_annotated_code_print(code, offsets);
-				r_vector_free(offsets);
+				RzVector *offsets = rz_annotated_code_line_offsets(code);
+				rz_core_annotated_code_print(code, offsets);
+				rz_vector_free(offsets);
 			}
 			break;
 			case DecompileMode::DEFAULT:
-				r_core_annotated_code_print(code, nullptr);
+				rz_core_annotated_code_print(code, nullptr);
 				break;
 			case DecompileMode::STATEMENTS:
-				r_core_annotated_code_print_comment_cmds(code);
+				rz_core_annotated_code_print_comment_cmds(code);
 				break;
 			case DecompileMode::JSON:
-				r_core_annotated_code_print_json(code);
+				rz_core_annotated_code_print_json(code);
 				break;
 			case DecompileMode::XML:
 				out_stream << "</code></result>";
 				// fallthrough
 			default:
-				r_cons_printf("%s\n", out_stream.str().c_str());
+				rz_cons_printf("%s\n", out_stream.str().c_str());
 				break;
 		}
-
-		r_annotated_code_free(code);
+		rz_annotated_code_free(code);
 #ifndef DEBUG_EXCEPTIONS
 	}
 	catch(const LowlevelError &error)
@@ -278,7 +301,7 @@ static void Decompile(RCore *core, DecompileMode mode)
 			pj_s(pj, s.c_str());
 			pj_end(pj);
 			pj_end(pj);
-			r_cons_printf ("%s\n", pj_string (pj));
+			rz_cons_printf ("%s\n", pj_string (pj));
 			pj_free(pj);
 		}
 		else
@@ -297,58 +320,131 @@ class AssemblyRaw : public AssemblyEmit
 			std::stringstream ss;
 			addr.printRaw(ss);
 			ss << ": " << mnem << ' ' << body;
-			r_cons_printf("%s\n", ss.str().c_str());
+			rz_cons_printf("%s\n", ss.str().c_str());
 		}
 };
 
 class PcodeRawOut : public PcodeEmit
 {
 	private:
-		static void print_vardata(ostream &s, VarnodeData &data)
+		const Translate *trans = nullptr;
+
+		void print_vardata(ostream &s, VarnodeData &data)
 		{
-			s << '(' << data.space->getName() << ',';
-			data.space->printOffset(s,data.offset);
-			s << ',' << dec << data.size << ')';
-		}
+			AddrSpace *space = data.space;
+			if(space->getName() == "register" || space->getName() == "mem")
+			    s << space->getTrans()->getRegisterName(data.space, data.offset, data.size);
+		    else if(space->getName() == "ram")
+		    {
+			    if(data.size == 1)
+				    s << "byte_ptr(";
+			    if(data.size == 2)
+				    s << "word_ptr(";
+			    if(data.size == 4)
+				    s << "dword_ptr(";
+			    if(data.size == 8)
+				    s << "qword_ptr(";
+			    space->printRaw(s, data.offset);
+			    s << ')';
+		    }
+		    else if(space->getName() == "const")
+			    static_cast<ConstantSpace *>(space)->printRaw(s, data.offset);
+		    else if(space->getName() == "unique")
+		    {
+			    s << '(' << data.space->getName() << ',';
+			    data.space->printOffset(s, data.offset);
+			    s << ',' << dec << data.size << ')';
+		    }
+		    else if(space->getName() == "DATA")
+			{
+				s << '(' << data.space->getName() << ',';
+				data.space->printOffset(s,data.offset);
+				s << ',' << dec << data.size << ')';
+			}
+			else
+			{
+			    s << '(' << data.space->getName() << ',';
+			    data.space->printOffset(s, data.offset);
+			    s << ',' << dec << data.size << ')';
+		    }
+	    }
 
 	public:
-		void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars, int4 isize) override
-		{
-			std::stringstream ss;
-			if(outvar)
-			{
-				print_vardata(ss,*outvar);
+	    PcodeRawOut(const Translate *t): trans(t) {}
+
+	    void dump(const Address &addr, OpCode opc, VarnodeData *outvar, VarnodeData *vars,
+	              int4 isize) override
+	    {
+		    std::stringstream ss;
+		    if(opc == CPUI_STORE && isize == 3)
+		    {
+			    print_vardata(ss, vars[2]);
+			    ss << " = ";
+			    isize = 2;
+		    }
+		    if(outvar)
+		    {
+			    print_vardata(ss,*outvar);
 				ss << " = ";
-			}
-			ss << get_opname(opc);
+		    }
+		    ss << get_opname(opc);
 			// Possibly check for a code reference or a space reference
-			for(int4 i=0; i<isize; ++i)
+			ss << ' ';
+			// For indirect case in SleighBuilder::dump(OpTpl *op)'s "vn->isDynamic(*walker)" branch.
+			if (isize > 1 && vars[0].size == sizeof(AddrSpace *) && vars[0].space->getName() == "const"
+				&& (vars[0].offset >> 24) == ((uintb)vars[1].space >> 24) && trans == ((AddrSpace*)vars[0].offset)->getTrans())
 			{
-				ss << ' ';
-				print_vardata(ss, vars[i]);
-			}
-			r_cons_printf("    %s\n", ss.str().c_str());
-		}
+				ss << ((AddrSpace*)vars[0].offset)->getName();
+			    ss << '[';
+			    print_vardata(ss, vars[1]);
+			    ss << ']';
+			    for(int4 i = 2; i < isize; ++i)
+			    {
+				    ss << ", ";
+				    print_vardata(ss, vars[i]);
+			    }
+		    }
+		    else
+		    {
+			    print_vardata(ss, vars[0]);
+			    for(int4 i = 1; i < isize; ++i)
+			    {
+				    ss << ", ";
+					print_vardata(ss, vars[i]);
+			    }
+		    }
+			rz_cons_printf("    %s\n", ss.str().c_str());
+	    }
 };
 
-static void Disassemble(RCore *core, ut64 ops)
+static void Disassemble(RzCore *core, ut64 ops)
 {
 	if(!ops)
 		ops = 10; // random default value
 
-	R2Architecture arch(core, cfg_var_sleighid.GetString(core->config));
+	RizinArchitecture arch(core, cfg_var_sleighid.GetString(core->config));
 	DocumentStorage store;
 	arch.init(store);
 
 	const Translate *trans = arch.translate;
-	PcodeRawOut emit;
+	PcodeRawOut emit(arch.translate);
 	AssemblyRaw assememit;
 	Address addr(trans->getDefaultCodeSpace(), core->offset);
 	for(ut64 i=0; i<ops; i++)
 	{
-		trans->printAssembly(assememit, addr);
-		auto length = trans->oneInstruction(emit, addr);
-		addr = addr + length;
+		try
+		{
+			trans->printAssembly(assememit, addr);
+			auto length = trans->oneInstruction(emit, addr);
+			addr = addr + length;
+		}
+		catch(const BadDataError &error)
+		{
+			std::stringstream ss;
+			addr.printRaw(ss);
+			rz_cons_printf("%s: invalid\n", ss.str().c_str());
+			addr = addr + trans->getAlignment();
+		}
 	}
 }
 
@@ -360,7 +456,7 @@ static void ListSleighLangs()
 	auto langs = SleighArchitecture::getLanguageDescriptions();
 	if(langs.empty())
 	{
-		r_cons_printf("No languages available, make sure %s is set correctly!\n", cfg_var_sleighhome.GetName());
+		rz_cons_printf("No languages available, make sure %s is set correctly!\n", cfg_var_sleighhome.GetName());
 		return;
 	}
 
@@ -368,17 +464,17 @@ static void ListSleighLangs()
 	std::transform(langs.begin(), langs.end(), std::back_inserter(ids), [](const LanguageDescription &lang) { return lang.getId(); });
 	std::sort(ids.begin(), ids.end());
 	std::for_each(ids.begin(), ids.end(), [](const std::string &id) {
-		r_cons_printf("%s\n", id.c_str());
+		rz_cons_printf("%s\n", id.c_str());
 	});
 }
 
-static void PrintAutoSleighLang(RCore *core)
+static void PrintAutoSleighLang(RzCore *core)
 {
 	DecompilerLock lock;
 	try
 	{
 		auto id = SleighIdFromCore(core);
-		r_cons_printf("%s\n", id.c_str());
+		rz_cons_printf("%s\n", id.c_str());
 	}
 	catch(LowlevelError &e)
 	{
@@ -386,27 +482,35 @@ static void PrintAutoSleighLang(RCore *core)
 	}
 }
 
-static void _cmd(RCore *core, const char *input)
+static void EnablePlugin(RzCore *core)
 {
-	switch (*input)
+	auto id = SleighIdFromCore(core);
+	rz_config_set(core->config, "ghidra.lang", id.c_str());
+	rz_config_set(core->config, "asm.cpu", id.c_str());
+	rz_config_set(core->config, "asm.arch", "ghidra");
+}
+
+static void _cmd(RzCore *core, const char *input)
+{
+	switch(*input)
 	{
 		case 'd': // "pdgd"
-			Decompile(core, DecompileMode::DEBUG_XML);
+			DecompileCmd(core, DecompileMode::DEBUG_XML);
 			break;
 		case '\0': // "pdg"
-			Decompile(core, DecompileMode::DEFAULT);
+			DecompileCmd(core, DecompileMode::DEFAULT);
 			break;
 		case 'x': // "pdgx"
-			Decompile(core, DecompileMode::XML);
+			DecompileCmd(core, DecompileMode::XML);
 			break;
 		case 'j': // "pdgj"
-			Decompile(core, DecompileMode::JSON);
+			DecompileCmd(core, DecompileMode::JSON);
 			break;
 		case 'o': // "pdgo"
-			Decompile(core, DecompileMode::OFFSET);
+			DecompileCmd(core, DecompileMode::OFFSET);
 			break;
 		case '*': // "pdg*"
-			Decompile(core, DecompileMode::STATEMENTS);
+			DecompileCmd(core, DecompileMode::STATEMENTS);
 			break;
 		case 's': // "pdgs"
 			switch(input[1])
@@ -422,15 +526,18 @@ static void _cmd(RCore *core, const char *input)
 					break;
 			}
 			break;
+		case 'a': // "pdga"
+			EnablePlugin(core);
+			break;
 		default:
 			PrintUsage(core);
 			break;
 	}
 }
 
-static int r2ghidra_cmd(void *user, const char *input)
+static int rz_ghidra_cmd(void *user, const char *input)
 {
-	RCore *core = (RCore *) user;
+	RzCore *core = (RzCore *) user;
 	if (!strncmp (input, CMD_PREFIX, strlen(CMD_PREFIX)))
 	{
 		_cmd (core, input + 3);
@@ -442,7 +549,7 @@ static int r2ghidra_cmd(void *user, const char *input)
 bool SleighHomeConfig(void */* user */, void *data)
 {
 	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
-	auto node = reinterpret_cast<RConfigNode *>(data);
+	auto node = reinterpret_cast<RzConfigNode *>(data);
 	SleighArchitecture::shutdown();
 	SleighArchitecture::specpaths = FileManage();
 	if(node->value && *node->value)
@@ -450,9 +557,9 @@ bool SleighHomeConfig(void */* user */, void *data)
 	return true;
 }
 
-static void SetInitialSleighHome(RConfig *cfg)
+static void SetInitialSleighHome(RzConfig *cfg)
 {
-	// user-set, for example from .radare2rc
+	// user-set, for example from .rizinrc
 	if(!cfg_var_sleighhome.GetString(cfg).empty())
 		return;
 
@@ -464,76 +571,73 @@ static void SetInitialSleighHome(RConfig *cfg)
 		return;
 	}
 
-#ifdef R2GHIDRA_SLEIGHHOME_DEFAULT
-	if(r_file_is_directory(R2GHIDRA_SLEIGHHOME_DEFAULT))
+#ifdef RZ_GHIDRA_SLEIGHHOME_DEFAULT
+	if(rz_file_is_directory(RZ_GHIDRA_SLEIGHHOME_DEFAULT))
 	{
-		cfg_var_sleighhome.Set(cfg, R2GHIDRA_SLEIGHHOME_DEFAULT);
+		cfg_var_sleighhome.Set(cfg, RZ_GHIDRA_SLEIGHHOME_DEFAULT);
 		return;
 	}
 #endif
 
-	// r2pm-installed ghidra
-	char *homepath = r_str_home(".local/share/radare2/r2pm/git/ghidra");
-	if(homepath && r_file_is_directory(homepath))
+	// rz-pm-installed ghidra
+	char *homepath = rz_str_home(".local/share/rizin/rz-pm/git/ghidra");
+	if(homepath && rz_file_is_directory(homepath))
 	{
 		cfg_var_sleighhome.Set(cfg, homepath);
 	}
-	r_mem_free (homepath);
+	rz_mem_free (homepath);
 }
 
-static int r2ghidra_init(void *user, const char *cmd)
+static int rz_ghidra_init(void *user, const char *cmd)
 {
 	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
 	startDecompilerLibrary(nullptr);
 
-	auto *rcmd = reinterpret_cast<RCmd *>(user);
-	auto *core = reinterpret_cast<RCore *>(rcmd->data);
-	RConfig *cfg = core->config;
-	r_config_lock (cfg, false);
+	auto *rcmd = reinterpret_cast<RzCmd *>(user);
+	auto *core = reinterpret_cast<RzCore *>(rcmd->data);
+	RzConfig *cfg = core->config;
+	rz_config_lock (cfg, false);
 	for(const auto var : ConfigVar::GetAll())
 	{
-		RConfigNode *node;
+		RzConfigNode *node;
 		if(var->GetCallback())
-			node = r_config_set_cb(cfg, var->GetName(), var->GetDefault(), var->GetCallback());
+			node = rz_config_set_cb(cfg, var->GetName(), var->GetDefault(), var->GetCallback());
 		else
-			node = r_config_set(cfg, var->GetName(), var->GetDefault());
-		r_config_node_desc(node, var->GetDesc());
+			node = rz_config_set(cfg, var->GetName(), var->GetDefault());
+		rz_config_node_desc(node, var->GetDesc());
 	}
-	r_config_lock (cfg, true);
+	rz_config_lock (cfg, true);
 
 	SetInitialSleighHome(cfg);
 	return true;
 }
 
-static int r2ghidra_fini(void *user, const char *cmd)
+static int rz_ghidra_fini(void *user, const char *cmd)
 {
 	std::lock_guard<std::recursive_mutex> lock(decompiler_mutex);
 	shutdownDecompilerLibrary();
 	return true;
 }
 
-RCorePlugin r_core_plugin_ghidra = {
-	/* .name = */ "r2ghidra",
+RzCorePlugin rz_core_plugin_ghidra = {
+	/* .name = */ "ghidra",
 	/* .desc = */ "Ghidra integration",
 	/* .license = */ "GPL3",
 	/* .author = */ "thestr4ng3r",
 	/* .version = */ nullptr,
-	/*.call = */ r2ghidra_cmd,
-	/*.init = */ r2ghidra_init,
-	/*.fini = */ r2ghidra_fini
+	/*.call = */ rz_ghidra_cmd,
+	/*.init = */ rz_ghidra_init,
+	/*.fini = */ rz_ghidra_fini
 };
 
 #ifndef CORELIB
-#ifdef __cplusplus
-extern "C"
-#endif
-R_API RLibStruct radare_plugin = {
-	/* .type = */ R_LIB_TYPE_CORE,
-	/* .data = */ &r_core_plugin_ghidra,
-	/* .version = */ R2_VERSION,
-	/* .free = */ nullptr
-#if R2_VERSION_MAJOR >= 4 && R2_VERSION_MINOR >= 2
-	, "r2ghidra-dec"
-#endif
+extern "C" {
+RZ_API RzLibStruct rizin_plugin = {
+	/* .type = */ RZ_LIB_TYPE_CORE,
+	/* .data = */ &rz_core_plugin_ghidra,
+	/* .version = */ RZ_VERSION,
+	/* .free = */ nullptr,
+	/* .pkgname = */ "rz-ghidra"
 };
+}
 #endif

@@ -3,10 +3,16 @@
 set -e
 set -x
 
-mkdir build && cd build
-cmake .. -DBUILD_SLEIGH_PLUGIN=ON -DCMAKE_INSTALL_PREFIX=$HOME/.local "$@"
-make -j8
-make install
+git clone --depth 1 https://github.com/rizinorg/cutter
 
-cd ../test
+cmake -Bbuild -GNinja \
+	"-DCUTTER_SOURCE_DIR=$(pwd)/cutter" \
+	-DBUILD_CUTTER_PLUGIN=ON \
+	-DBUILD_SLEIGH_PLUGIN=ON \
+	-DCMAKE_INSTALL_PREFIX=$HOME/.local \
+	"$@"
+ninja -C build
+ninja -C build install
+
+cd test
 make
